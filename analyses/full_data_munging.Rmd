@@ -1,0 +1,453 @@
+---
+title: "BAYSICSS ~ DonorsChoose ~ Reaching Equity"
+author: "Brooke Staveland"
+date: "6/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo <- FALSE,  # don't print the code chunk
+  warning <- FALSE,  # don't print warnings
+  message <- FALSE,  # don't print messages
+  fig.width <- 20,  # set default width of figures
+  fig.height <- 15,  # set default height of figures
+  fig.align <- "center",  # always align figure in center
+  fig.pos <- "H",  # always plot figure at the exact location of the code chunk
+  cache <- TRUE)  # cache results
+
+## libraries ##
+library(tidyverse)
+library(ggplot2)
+library(magrittr)
+library(ggthemr)
+library(grid)
+library(gtable)
+library(gridExtra)
+library(wesanderson)
+library(ggsci)
+library(zoo)
+library(kableExtra)
+library(lme4)
+library(RColorBrewer)
+library(doParallel)
+library(parallel)
+library(foreach)
+library(here)
+library(fs)
+library(ggcorrplot)
+library(viridis)
+library(beepr)
+library(stringr)
+library(lmtest)
+library(vctrs)
+library(janitor)
+
+## hand written functions ##
+source(path(here(), "R", 'mutate_cond.R'))
+
+## plotting helpers ##
+ggthemr("solarized")
+ggthemr("pale", layout = "plain")
+getPalette = colorRampPalette(brewer.pal(10, "Set1"))
+
+
+# ## paralellization ##
+# nCores <- 2
+# registerDoParallel(nCores)
+
+```
+
+## Intro
+
+This notebook is written to investigate how `DonorsChoose` donations might increase dollar-per-student amount in lower income schools in order to achieve equity with high income schools. 
+
+Definitions of low and high income schools are based on per pupil expenditure released at the school level and made available on each state's department of education website. The specifics of the high/low split were done by Brian Heseung Kim, but briefly, we sorted the schools by per pupil expenditure and took the top and bottom quintiles for each state. Of note, we split New York into schools within New York City and without, due to the increased costs (and thus expenditures) in New York City.
+
+We operationalized the `DonorsChoose` donations by summing the total donations from every funded project across each school and then dividing by either the total enrolled students or by the number of students reached, as defined in the `DonorsChoose` data. The total donation value is denoted `total_funding_by_donation`, the total donated / enrolled is denoted `perpupil_donation` and total donated / reached is `perpupil_donation` in the following scripts. 
+
+After asking Mohammad about the `Funding Status` variable, I decided to exclude it from the analyses, since we do not know where that money ended up, and `DonorsChoose` has done different things with that quanity during different years.
+
+
+
+```{r load-data, echo = F, results = F, warning=FALSE}
+# cleaned data gathered from different state websites #
+cleaned_school_data <- read_csv(path(here(), "raw_data", "cleaned_data_schools_covid.csv"), col_types = cols())
+
+## donors choose data ##
+school_data <- read_csv(path(here(), "raw_data", "school.csv"), col_types = cols())
+project_donors_data <- read_csv(path(here(), "raw_data", "project_donors.csv"), col_types = cols())
+project_resources_data <- read_csv(path(here(), "raw_data", "project_resources.csv"), col_types = cols())
+project_school_teacher_data <- read_csv(path(here(), "raw_data", "project_school_teacher.csv"), col_types = cols())
+
+# fix columns names #
+colnames(school_data) <- vec_as_names(colnames(school_data), repair = "universal", quiet = T)
+colnames(project_donors_data) <- vec_as_names(colnames(project_donors_data), repair = "universal", quiet = T)
+colnames(project_resources_data) <- vec_as_names(colnames(project_resources_data), repair = "universal", quiet = T)
+colnames(project_school_teacher_data) <- vec_as_names(colnames(project_school_teacher_data), repair = "universal", quiet = T)
+
+# # take a peak #
+# school_data %>% head()
+# project_donors_data %>% head()
+# project_resources_data %>% head()
+# project_school_teacher_data %>% head() ## seems like projects_school_teacher has the majority of the variables we need then
+
+```
+
+## Data Cleaning
+
+The data had already been cleaned in the following ways by Brian Kim:
+
+(1) Charter schools are excluded across the board to make our data more comparable across states
+(2) New York State and New York City are split into separate "state" values (so use that to group_by later)
+(3) `bottom_group` (an indicator for schools in the bottom 20th percentile and below) was created
+(4) `top_group` (an indicator for schools in the top 80th percentile and above) was created
+(5) Number of teachers is added in for each school
+
+Additionally, I did the following:
+
+(1) Filtered the DonorsChoose data to the following states/groups: *Virginia*, *Illinois*, *Texas*, *Massachusetts*, *North Carolina*, *Florida*, *Georgia*, *New York State*, *New York City*
+(2) Filtered the data to only include projects, donations, and expenditures between `2018-08-01` and `2019-06-15`
+(3) Merged the DonorsChoose and cleaned expenditure data
+(4) Created the `total_funding_by_donation` variable
+(5) Checked for missingness. There were schools in the expenditure data that was missing from the DonorsChoose data, and vice versa. Additionally, we were missing some enrollment data for 44 schools were we had project, donation, and per pupil expenditure data.
+
+
+
+```{r clean-project_school_teacher_data, echo = F, results = F, warning=F}
+## lets cut out the states that we do not want ##
+# merge with state csv to get state info
+donors_data <- project_school_teacher_data %>% full_join(school_data, by = "School.ID")
+
+# only the states we have pupil expenditures for in #
+states_of_interest <- c(unique(cleaned_school_data$state), "New York") # adding New York since have it broken up in cleaned_data
+donors_data_clean <- donors_data %>%
+  filter(School.State %in% states_of_interest)
+
+# filter to the correct dates #
+start_date <- as.Date("2018-08-01")
+end_date <- as.Date("2019-06-15")
+donors_data_clean <- donors_data_clean %>%
+  filter(Project.Posted.Date <= end_date & Project.Posted.Date >= start_date)
+
+# convert ncessch id to numeric #
+donors_data_clean <- donors_data_clean %>%
+  mutate(School.Nces.ID = as.numeric(School.Nces.ID))
+
+# we will lose a lot of our data here, since the donors data doesn't cover all schools #
+length(unique(cleaned_school_data$NCESSCH))
+length(unique(donors_data_clean$School.Nces.ID))
+
+donors_expend_data <- inner_join(donors_data_clean, cleaned_school_data, by = c("School.Nces.ID" = "NCESSCH"))
+
+```
+
+```{r create_project_totals_by_school, echo=F}
+
+# for now just sum all the donations by the nces id #
+donors_expend_data <- donors_expend_data %>%
+  group_by(School.Nces.ID) %>%
+  mutate(total_funding_by_donation = sum(Project.Donation.Total.Amount))
+
+
+```
+
+```{r top-bottom-groups, echo = F}
+
+# break into groups #
+top_data <- donors_expend_data %>%
+  filter(top_group == 1)
+
+bottom_data <- donors_expend_data %>%
+  filter(bottom_group == 1)
+
+top_bottom_data <- donors_expend_data %>%
+    filter(top_group == 1 | bottom_group == 1)
+
+```
+
+
+```{r missingness-checks, echo = F}
+
+## check for missingess in our main vars of interest, but only in top and bottom groups ##
+
+top_bottom_data %>%
+  summarise_at(c("perpupil"), function(x) is.na(x)) %>%
+  tabyl(perpupil) %>%
+  kable(.) %>%
+  kable_styling(full_width = T)
+
+top_bottom_data %>%
+  summarise_at(c("total_funding_by_donation"), function(x) is.na(x)) %>%
+  tabyl(total_funding_by_donation) %>%
+  kable(.) %>%
+  kable_styling(full_width = T)
+
+top_bottom_data %>%
+  summarise_at(c("Project.Donation.Total.Amount"), function(x) is.na(x)) %>%
+  tabyl(Project.Donation.Total.Amount) %>%
+  kable(.) %>%
+  kable_styling(full_width = T)
+
+top_bottom_data %>%
+  summarise_at(c("enrollment"), function(x) is.na(x)) %>%
+  tabyl(enrollment) %>%
+  kable(.) %>%
+  kable_styling(full_width = T)
+
+```
+
+```{r recover-enrollment, echo = F}
+# print unique schools that are missing enrollment data
+top_bottom_data %>%
+  filter(is.na(enrollment) == T) %>%
+  distinct(school_name_nces) %>%
+  kable(.) %>%
+  kable_styling()
+
+# exclude them
+top_bottom_data <- top_bottom_data %>%
+  filter(!school_name_nces %in% c("HOSPITAL SCHOOLS", "EAST FLATBUSH COMMUNITY RESEARCH SCHOOL"))
+
+```
+
+Looking into the missing enrollment further, it seems that the two schools missing enrollment data are 1) a speciality school that students only attend if they are hospitalized, and 2) East Flatbush Community and Research School apparently merged with another school in 2017-2018. Thus, I decided to exclude them.
+
+```{r create-per-pupil-donation, echo = F}
+# now normalize the donation amount by the number of students enrolled or the number of students reached
+top_bottom_funded_data <- top_bottom_data %>%
+  filter(Project.Funding.Status == "completed") %>%
+  mutate(perpupil_donation = total_funding_by_donation/enrollment) %>%
+  group_by(Project.ID, .add = T) %>%
+  mutate(perreached_donation_each = Project.Donation.Total.Amount/Project.Students.Reached) %>%
+  ungroup() %>%
+  group_by(School.Nces.ID) %>%
+  mutate(perreached_donation = sum(perreached_donation_each))
+
+
+```
+
+## DonorsChoose Donations ~ High/Low Expenditures
+
+As a first pass, I wanted to see how the DonorsChoose donations differ between schools that have large per student expenditures versus schools that have low per student expenditures. Thus, the first plot shows violin plots for each state, broken down between high and low expenditure schools. Furthermore, I decided to log transform the expenditure data to better visually compare the distributions between high and low exp. schools.
+
+
+```{r perpupil-eda, echo = F, fig.width=15, fig.height=12}
+
+# outlier_line <- mean(top_bottom_funded_data$perpupil_donation) + 3*sd(top_bottom_funded_data$perpupil_donation)
+# top_bottom_funded_data %>%
+#   ungroup() %>%
+#   mutate(top_group = factor(top_group)) %>%
+#   ggplot(., aes(x = perpupil_donation)) +
+#   geom_histogram() +
+#   geom_vline(xintercept = outlier_line, color = "black")
+
+
+plot_perppupil_donation <- top_bottom_funded_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = log(perpupil_donation), fill = state, alpha = top_group)) +
+  geom_violin(position = position_dodge(width = .8)) + 
+  geom_boxplot(position = position_dodge(width = .8), 
+               width = .3,
+               notch = T,
+               notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", y = "Donation Total By School / Enrollment", x = "", subtitle = "* y axis was log transformed") +
+  guides(fill = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  ggtitle("DonorsChoose Donations Broken Down By State and High/Low State Expenditure")
+
+plot_perppupil_donation
+
+```
+There do not seem to be any locations in which lower income students are receiving more donations per student than their higher income counterparts. Most states seems to have fairly equal donation amounts across the two groups, though some states, such as Georgia, seem to have the reverse trend: more `DonorsChoose` money is going to the higher income schools than the lower income schools. 
+
+I am wondering if this due to more students in the lower income schools. Since this measure divides by enrolled students, it is possible that lower income schools could be getting equal or slightly more in donations, but then the per pupil measure washes this affect out. To address this, I tried to modify our measure by looking at the total donated amount / the number of students reached. We were cautioned about using the the `students reached` variable, since it was set by the teachers and is perhaps inflated. But I thought it was worth a shot!
+
+```{r perreached-eda, echo = F, fig.width=15, fig.height=12}
+
+plot_perreached_donation <- top_bottom_funded_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = log(perreached_donation), fill = state, alpha = top_group)) +
+  geom_violin(position = position_dodge(width = .8)) + 
+  geom_boxplot(position = position_dodge(width = .8), 
+               width = .3,
+               notch = T,
+               notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", 
+       y = "Donation Total By School / Students Reached", 
+       x = "", 
+       subtitle = "* y axis was log transformed") +
+  guides(fill = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  ggtitle("Students Reached Donations Broken Down By State and High/Low State Expenditure")
+
+plot_perreached_donation
+```
+
+This seems to soften the trend for higher income schools to recieve more `DonorsChoose` money. Since we do not have 100% faith in that variable, however, I also wanted to look at total funding amount, just plotted next to the enrollment numbers.
+
+```{r by-total-donation-eda, echo = F, fig.width=27, fig.height=12}
+
+plot_enrolled <- top_bottom_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = enrollment, fill = state, alpha = top_group)) +
+  geom_boxplot(position = position_dodge(width = .6), 
+               width = .5, 
+               notch=TRUE,
+                notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", 
+       y = "School Enrollment", 
+       x = "") +
+  guides(fill = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  theme(legend.position = "top", panel.border = element_rect(color = "black", fill = NA)) +
+  ggtitle("School Enrollment ~ State ~ High/Low State Expenditure")
+
+
+
+plot_total_funding <- top_bottom_funded_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = log(total_funding_by_donation), fill = state, alpha = top_group)) +
+  geom_violin(position = position_dodge(width = .8)) + 
+  geom_boxplot(position = position_dodge(width = .8), 
+               width = .3,
+               notch = T,
+               notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", 
+       y = "Donation Total By School", 
+       x = "") +
+  guides(fill = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  theme(panel.border = element_rect(color = "black", fill = NA), 
+        legend.position = "top") +
+  ggtitle("DonorsChoose Total Donations ~ State ~ High/Low State Expenditure")
+
+
+plot(arrangeGrob(grobs = list(ggplotGrob(plot_enrolled),ggplotGrob(plot_total_funding)), nrow = 1, ncol = 2))
+```
+
+From this, it looks like that across the board the lower income schools have more students (not surprising). Unfortunately, even in lump sump donations the higher income schools seem to be getting more DonorsChoose dollars
+
+```{r combine-plots-for-powerpoint, echo = F}
+
+## only run if not knitting
+# plot(arrangeGrob(grobs = list(ggplotGrob(plot_perppupil_donation),ggplotGrob(plot_perreached_donation), ggplotGrob(plot_enrolled),ggplotGrob(plot_total_funding)), nrow = 2, ncol = 2))
+
+
+```
+
+
+### Amount Requested
+
+So why might that be? It could be that the lower income schools are requesting less money? Or are less likely to be funded. 
+
+```{r funding-rates, echo = F, fig.width=22, fig.height=12}
+
+plot_excluding_optional_rquested <- top_bottom_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = log(Project.Total.Price.Excluding.Optional.Support), fill = state, alpha = top_group)) +
+  geom_col(position = "dodge2") +
+  # geom_violin(position = position_dodge(width = .8)) + 
+  # geom_boxplot(position = position_dodge(width = .8), 
+  #              width = .3,
+  #              notch = T,
+  #              notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", 
+       y = "Donation Total By School", 
+       x = "", 
+       subtitle = "Excluding Optional Donation") +
+  guides(fill = FALSE, alpha = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  ggtitle("DonorsChoose Requested Funding Broken Down By State and High/Low State Expenditure")
+
+
+plot_including_optional_rquested <- top_bottom_data %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = log(Project.Total.Price.Including.Optional.Support), fill = state, alpha = top_group)) +
+  geom_col(position = "dodge2") +
+  # geom_violin(position = position_dodge(width = .8)) + 
+  # geom_boxplot(position = position_dodge(width = .8), 
+  #              width = .3,
+  #              notch = T,
+  #              notchwidth = 0.8) +
+  labs(alpha = "Per Pupil School Exp.", 
+       y = "", 
+       x = "", 
+       subtitle = "Including Optional Donation") +
+  guides(fill = FALSE) +
+  scale_fill_uchicago() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  ggtitle("")
+
+
+plot(arrangeGrob(grobs = list(ggplotGrob(plot_excluding_optional_rquested),ggplotGrob(plot_including_optional_rquested)), nrow = 1, ncol = 2))
+
+```
+
+Schools do seem to be across the board requesting a similar amount of money (which means lower income schools are requesting less money per student).
+
+### Unique Projects
+
+```{r requested-projects, echo = F, fig.width=15, fig.height=12}
+
+plot_aggreagate_funding_status <- top_bottom_data %>%
+  filter(Project.Funding.Status != "reallocated") %>%
+  mutate(Count = n()) %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = Project.Funding.Status, y = Count, fill = Project.Funding.Status, alpha = top_group)) +
+  geom_boxplot(position = position_dodge(width = .7), 
+               width = .5, 
+               notch=T,
+              notchwidth = 0.8) +
+  labs(fill = "Funding Status", 
+       y = "Number of Projects By School", 
+       x = "",
+       alpha = "Per Pupil School Exp.") +
+  scale_fill_npg() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  theme(legend.position = "top", panel.border = element_rect(color = "black", fill = NA)) +
+  ggtitle("DonorsChoose Number of Funded Projects Broken Down High/Low State Expenditure") +
+  coord_flip()
+
+
+
+plot_state_funding_status <- top_bottom_data %>%
+  filter(Project.Funding.Status != "reallocated") %>%
+  mutate(Count = n()) %>%
+  ungroup() %>%
+  mutate(top_group = factor(top_group, levels = c(0, 1), labels =  c("Low Group", "High Group"))) %>%
+  ggplot(., aes(x = state, y = Count, fill = Project.Funding.Status, alpha = top_group)) +
+  geom_boxplot(position = position_dodge(width = .7), 
+               width = .5, 
+               notch=T,
+              notchwidth = 0.8) +
+  labs(fill = "Funding Status", 
+       y = "Number of Projects By School", 
+       x = "",
+       alpha = "Per Pupil School Exp.") +
+  guides(fill = F, alpha = F) +
+  scale_fill_npg() +
+  scale_alpha_manual(values = c(.5, 1)) +
+  theme(legend.position = "top", panel.border = element_rect(color = "black", fill = NA)) +
+  ggtitle("DonorsChoose Number of Projects Broken Down By State and High/Low State Expenditure") 
+
+
+plot(arrangeGrob(grobs = list(ggplotGrob(plot_aggreagate_funding_status),ggplotGrob(plot_state_funding_status)), nrow = 2, ncol = 1))
+
+
+```
+
+
+These plots show little evidence that projects from lower funded schools are less likely to be funded, nor more likely to expire, with the exception of a slight bias in Massachusetts. I think this points to the problem being that lower income schools are asking for less money per pupil, or for an equal number of donations overall as their higher income counterparts. 

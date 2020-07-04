@@ -1,0 +1,66 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+
+## Libraries
+library(tidyverse)
+library(readxl)
+library(here)
+library(fs)
+library(vctrs)
+```
+
+
+## what files do we need?
+
+From loading them all, I think we need `UserGL.xlsx`
+
+```{r which-data}
+
+files <- list.files("./raw_data")
+
+for(file in files){
+  
+  tmp <- read_xlsx(path(here(), "raw_data", file))
+  head(tmp)
+  
+}
+
+
+```
+
+
+```{r load-data}
+# load funding data #
+funding_data <- read_xlsx(path(here(), "raw_data", "UserGL.xlsx"))
+colnames(funding_data) <- vec_as_names(colnames(funding_data), repair = "universal")
+funding_data <- funding_data %>%
+  filter(!SchoolCode %in% c("0000000")) %>%
+  group_by(SchoolCode) %>%
+  mutate(total_expense = sum(Value)) %>%
+  distinct(SchoolCode, .keep_all = T)
+
+# load enorllment data #
+enrollment_data <- read_xlsx(path(here(), "raw_data", "cupc1819-k12.xlsx"), sheet = 3, skip = 2)
+colnames(enrollment_data) <- vec_as_names(colnames(enrollment_data), repair = "universal")
+enrollment_data <- enrollment_data %>%
+  filter(School.Code %in% unique(funding_data$SchoolCode)) %>%
+  filter(!School.Code %in% c("0000000"))
+
+# merge data #
+pupil_expenditures_ca <- merge.data.frame(funding_data, enrollment_data, by.x = "SchoolCode", by.y = "School.Code", all.x = T)
+colnames(pupil_expenditures_ca) <- vec_as_names(colnames(pupil_expenditures_ca), repair = "universal")
+
+pupil_expenditures_ca_clean <- pupil_expenditures_ca %>%
+  filter(Charter...School....Y.N. == "No") %>%
+  rename(CALPADS_Count = CALPADS.Unduplicated...Pupil.Count...UPC.) %>%
+  rename(Total_enrollment = Total...Enrollment) %>%
+  select(SchoolCode, Fiscalyear, Value, Total_enrollment, Foster, Homeless, CALPADS_Count) %>%
+  group_by(SchoolCode) %>%
+  mutate(pupil_exp = Value /  CALPADS_Count)
+
+
+```
